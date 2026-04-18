@@ -1,0 +1,8 @@
+node_modules/
+npm-debug.log
+.env
+build/
+.DS_Store
+dist/
+coverage/
+*.lognode_modules/

@@ -1,0 +1,1868 @@
+{
+  "name": "Doctome \u2013 Automation & Cron Only",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "doctome-appointment",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "5672de1f-03b1-44fb-a2bf-1cb6a7018395",
+      "name": "New Appointment Booking",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        -7024,
+        1344
+      ],
+      "webhookId": "2276429c-c11c-41d7-bd99-48b4f1678c6f"
+    },
+    {
+      "parameters": {
+        "url": "https://api.open-meteo.com/v1/forecast?latitude=36.19&longitude=5.41&current=temperature_2m,weathercode",
+        "options": {}
+      },
+      "id": "4c0d1184-0ebd-482d-8c4b-e8a65701b877",
+      "name": "Fetch Weather",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -6240,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 FIXED: flatten webhook body once, enrich with weather \u2500\u2500\nconst raw = $('New Appointment Booking').first().json;\n// n8n webhook sends body fields under .body in responseNode mode\nconst apt = raw.body ?? raw;\nconst wx  = $input.first().json;\n\n// Open-Meteo weathercode \u2192 label mapping (subset)\nconst WMO = {0:'Clear',1:'Clear',2:'Cloudy',3:'Cloudy',45:'Cloudy',48:'Cloudy',\n  51:'Rainy',53:'Rainy',55:'Rainy',61:'Rainy',63:'Rainy',65:'Rainy',\n  71:'Cold',73:'Cold',75:'Cold',80:'Rainy',81:'Rainy',82:'Rainy',\n  95:'Rainy',96:'Rainy',99:'Rainy'};\n\nconst code  = wx?.current?.weathercode ?? 0;\nconst tempC = wx?.current?.temperature_2m ?? 20;\nlet weather = WMO[code] ?? 'Clear';\nif (tempC > 36) weather = 'Hot';\nelse if (tempC < 8 && weather === 'Clear') weather = 'Cold';\n\nconst aptDate    = new Date(apt.appointment_date);\nconst bookedDate = new Date(apt.booked_date || new Date().toISOString());\nconst leadDays   = Math.max(0, Math.round((aptDate - bookedDate) / 86400000));\nconst dow        = aptDate.getDay();\nconst dayOfWeek  = dow === 0 ? 6 : dow - 1;   // Mon=0 \u2026 Sun=6\n\nreturn [{ json: { ...apt, weather, temperature_c: tempC, lead_days: leadDays, day_of_week: dayOfWeek } }];\n"
+      },
+      "id": "b3d86f25-608d-40ed-9359-c0f92806cf00",
+      "name": "Enrich with Weather",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5984,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Doctome No-Show Scoring Engine v1.1 \u2500\u2500\nconst MODEL = {\n  base_rate: 0.4133,\n  features: {\n    distance:       { near:{woe:-0.2705}, mid:{woe:0.2295}, far:{woe:0.5124} },\n    lead_days:      { short:{woe:-0.2022}, medium:{woe:0.0649}, long:{woe:0.1831} },\n    weather:        { Clear:{woe:-0.0336}, Cloudy:{woe:-0.0108}, Rainy:{woe:0.0288},\n                      Hot:{woe:0.1053}, Sandstorm:{woe:0.2453}, Cold:{woe:-0.3322} },\n    prior_no_shows: { \"0\":{woe:-0.150}, \"1\":{woe:0.400}, \"2+\":{woe:0.850} },\n    age_group:      { child:{woe:-0.0431}, adult:{woe:-0.0341}, senior:{woe:0.2039} },\n    day_of_week:    { \"0\":{woe:0.0843},\"1\":{woe:-0.1576},\"2\":{woe:-0.0620},\n                      \"3\":{woe:0.0380},\"4\":{woe:0.2747},\"5\":{woe:0.2577},\"6\":{woe:-0.3970} },\n    hour:           { early:{woe:0.2613}, core:{woe:-0.0059}, late:{woe:-0.0772} },\n    payment:        { Cash:{woe:0.0534}, Insurance:{woe:-0.0079}, Corporate:{woe:-0.0475} },\n    first_visit:    { \"0\":{woe:-0.04}, \"1\":{woe:0.10} },\n    reminder:       { \"true\":{woe:-0.2113}, \"false\":{woe:0.1622} }\n  },\n  thresholds: { high: 0.60, medium: 0.40 },\n  weights: { prior_no_shows:0.28, distance:0.18, lead_days:0.15, weather:0.10,\n             reminder:0.10, age_group:0.07, day_of_week:0.05, hour:0.04,\n             payment:0.02, first_visit:0.01 }\n};\nfunction dist(km)  { return km>40?'far':km>15?'mid':'near'; }\nfunction lead(d)   { return d>14?'long':d>7?'medium':'short'; }\nfunction age(a)    { return a<18?'child':a>70?'senior':'adult'; }\nfunction hour_(h)  { return h<9?'early':h>16?'late':'core'; }\nfunction woe(map,k,fb){ return (map[k]??map[fb??k]??{woe:0}).woe; }\n\nconst i   = $input.first().json;\nconst prK = Number(i.prior_no_shows)>=2?'2+':String(Math.min(1,Number(i.prior_no_shows)||0));\nconst rem = String(i.reminder_sent===true||i.reminder_sent==='true'||i.reminder_sent===1);\nconst F=MODEL.features, W=MODEL.weights;\nconst wSum =\n  W.prior_no_shows * woe(F.prior_no_shows, prK) +\n  W.distance       * woe(F.distance,       dist(Number(i.distance_km)||5)) +\n  W.lead_days      * woe(F.lead_days,      lead(Number(i.lead_days)||3)) +\n  W.weather        * woe(F.weather,        i.weather||'Clear','Clear') +\n  W.reminder       * woe(F.reminder,       rem) +\n  W.age_group      * woe(F.age_group,      age(Number(i.age)||30)) +\n  W.day_of_week    * woe(F.day_of_week,    String(Number(i.day_of_week)||0)) +\n  W.hour           * woe(F.hour,           hour_(Number(i.appointment_hour)||10)) +\n  W.payment        * woe(F.payment,        i.payment_type||'Cash','Cash') +\n  W.first_visit    * woe(F.first_visit,    String(Number(i.is_first_visit)||0));\n\nconst base = MODEL.base_rate;\nconst prob = Math.round((1/(1+Math.exp(-(Math.log(base/(1-base))+wSum*3.5))))*100)/100;\nconst risk = prob>=MODEL.thresholds.high?'HIGH':prob>=MODEL.thresholds.medium?'MEDIUM':'LOW';\nconst emoji= risk==='HIGH'?'\ud83d\udd34':risk==='MEDIUM'?'\ud83d\udfe1':'\ud83d\udfe2';\nconst action=risk==='HIGH'?'Send reminder NOW + flag for overbooking':\n             risk==='MEDIUM'?'Schedule reminder 24h before appointment':'No action needed';\n\nconst drivers=[\n  {f:'Prior no-shows', s:W.prior_no_shows*Math.abs(woe(F.prior_no_shows,prK)), r:woe(F.prior_no_shows,prK)},\n  {f:'Distance',       s:W.distance*Math.abs(woe(F.distance,dist(Number(i.distance_km)||5))), r:woe(F.distance,dist(Number(i.distance_km)||5))},\n  {f:'Lead time',      s:W.lead_days*Math.abs(woe(F.lead_days,lead(Number(i.lead_days)||3))), r:woe(F.lead_days,lead(Number(i.lead_days)||3))},\n  {f:'Weather',        s:W.weather*Math.abs(woe(F.weather,i.weather||'Clear','Clear')), r:woe(F.weather,i.weather||'Clear','Clear')},\n  {f:'No reminder',    s:W.reminder*Math.abs(woe(F.reminder,rem)), r:woe(F.reminder,rem)},\n].filter(d=>d.r>0.05).sort((a,b)=>b.s-a.s).slice(0,3).map(d=>d.f);\n\nreturn [{json:{\n  appointment_id:i.appointment_id, patient_id:i.patient_id,\n  patient_name:i.patient_name||'Patient', patient_phone:i.patient_phone||null,\n  appointment_date:i.appointment_date, appointment_hour:Number(i.appointment_hour)||10,\n  specialty:i.specialty||'General Practice', clinic_name:i.clinic_name||'Doctome Clinic',\n  wilaya:i.wilaya||'', age:Number(i.age)||30, distance_km:Number(i.distance_km)||5,\n  gender:i.gender||'', prior_visits:i.prior_visits||0, booked_date:i.booked_date||'',\n  prior_no_shows:Number(i.prior_no_shows)||0, is_first_visit:Number(i.is_first_visit)||0,\n  payment_type:i.payment_type||'Cash', reminder_sent:rem==='true',\n  no_show_probability:prob, risk_level:risk, risk_emoji:emoji, action, top_risk_drivers:drivers,\n  scored_at:new Date().toISOString(), weather:i.weather||'Clear',\n  lead_days:Number(i.lead_days)||3, day_of_week:Number(i.day_of_week)||0\n}}];"
+      },
+      "id": "944c6c1f-3453-49c4-b074-059a52bd9d84",
+      "name": "No-Show Scoring Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5744,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Receives enriched + scored appointment from No-Show Scoring Engine\n// Generates appointment_id if not provided, sets status, cleans for MongoDB\nconst i = $input.first().json;\n\nconst apt_id = i.appointment_id || ('APT-' + Date.now() + '-' + Math.random().toString(36).slice(2,7).toUpperCase());\n\nreturn [{json: {\n  appointment_id:      apt_id,\n  patient_id:          i.patient_id          || null,\n  patient_name:        i.patient_name         || 'Unknown',\n  patient_phone:       i.patient_phone        || null,\n  doctor_id:           i.doctor_id            || null,\n  clinic_name:         i.clinic_name          || 'Doctome Clinic',\n  specialty:           i.specialty            || 'General Practice',\n  wilaya:              i.wilaya               || '',\n  appointment_date:    i.appointment_date     || null,\n  appointment_hour:    Number(i.appointment_hour) || 10,\n  booked_date:         i.booked_date          || new Date().toISOString(),\n  status:              'scheduled',\n  // Patient snapshot fields\n  age:                 Number(i.age)          || null,\n  gender:              i.gender               || null,\n  distance_km:         Number(i.distance_km)  || null,\n  payment_type:        i.payment_type         || 'Cash',\n  prior_no_shows:      Number(i.prior_no_shows) || 0,\n  prior_visits:        Number(i.prior_visits)   || 0,\n  is_first_visit:      Number(i.is_first_visit) || 0,\n  reminder_sent:       i.reminder_sent === true || i.reminder_sent === 'true',\n  reminder_2h_sent:    false,\n  // Enrichment\n  weather:             i.weather              || 'Clear',\n  temperature_c:       i.temperature_c        || null,\n  lead_days:           Number(i.lead_days)    || 0,\n  day_of_week:         Number(i.day_of_week)  || 0,\n  // Scoring results\n  no_show_probability: i.no_show_probability  || null,\n  risk_level:          i.risk_level           || 'LOW',\n  risk_emoji:          i.risk_emoji           || '\ud83d\udfe2',\n  action:              i.action               || 'No action needed',\n  top_risk_drivers:    i.top_risk_drivers     || [],\n  scored_at:           i.scored_at            || new Date().toISOString(),\n  // Confirmation\n  patient_confirmed:   null,\n  patient_declined:    false,\n  reschedule_offer_sent: false,\n  // Timestamps\n  created_at:          new Date().toISOString(),\n  updated_at:          new Date().toISOString()\n}}];\n"
+      },
+      "id": "6925f0fb-c17d-41bc-9a2d-c7757717be15",
+      "name": "Prepare Appointment for DB",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6240,
+        1808
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "appointments",
+        "fields": "appointment_id,patient_id,patient_name,patient_phone,doctor_id,clinic_name,specialty,wilaya,appointment_date,appointment_hour,booked_date,status,age,gender,distance_km,payment_type,prior_no_shows,prior_visits,is_first_visit,reminder_sent,reminder_2h_sent,weather,temperature_c,lead_days,day_of_week,no_show_probability,risk_level,risk_emoji,action,top_risk_drivers,scored_at,patient_confirmed,patient_declined,reschedule_offer_sent,created_at,updated_at",
+        "options": {}
+      },
+      "id": "6fba35a3-35fa-4979-8161-69cb1f3c7458",
+      "name": "Insert Appointment \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1,
+      "position": [
+        -5504,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "string": [
+                  {
+                    "value1": "={{ $json.risk_level }}",
+                    "operation": "equals",
+                    "value2": "HIGH"
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "string": [
+                  {
+                    "value1": "={{ $json.risk_level }}",
+                    "operation": "equals",
+                    "value2": "MEDIUM"
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "string": [
+                  {
+                    "value1": "={{ $json.risk_level }}",
+                    "operation": "equals",
+                    "value2": "LOW"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "935497f1-527b-4e63-9d41-f25be48dd293",
+      "name": "Route by Risk Level",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        -5264,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const a = $input.first().json;\nreturn [{json:{\n  user_id:        a.doctor_id || 'staff',   // SSE target\n  patient_id:     a.patient_id,\n  patient_name:   a.patient_name,\n  appointment_id: a.appointment_id,\n  type:           'high_risk_appointment',\n  risk_level:     a.risk_level,\n  no_show_probability: a.no_show_probability,\n  top_risk_drivers: a.top_risk_drivers,\n  appointment_date: a.appointment_date,\n  specialty:      a.specialty,\n  action:         a.action,\n  timestamp:      new Date().toISOString(),\n  message: `\ud83d\udd34 High no-show risk (${Math.round(a.no_show_probability*100)}%) for ${a.patient_name} on ${a.appointment_date}`\n}}];"
+      },
+      "id": "0f656dd2-b624-46a9-be2c-a2e34ce94ff9",
+      "name": "Store HIGH Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5040,
+        1312
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "notifications",
+        "fields": "patient_id,patient_name,appointment_id,type,risk_level,no_show_probability,top_risk_drivers,appointment_date,specialty,action,timestamp,message",
+        "options": {}
+      },
+      "id": "a7759dec-c201-4318-8238-08e51b39a106",
+      "name": "Write Notification \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4864,
+        1296
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{...$input.first().json,note:'Medium risk \u2013 reminder scheduled'}}];"
+      },
+      "id": "9e43855b-3199-4fc9-a58b-c54ae9f9d7bf",
+      "name": "MEDIUM \u2013 Log Note",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5568,
+        1648
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json:{...$input.first().json,note:'Low risk \u2013 no action'}}];"
+      },
+      "id": "aace2d42-bd64-4d6c-93a3-7be3caca93dc",
+      "name": "LOW \u2013 Log Note",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5264,
+        1584
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 16 * * *"
+            }
+          ]
+        }
+      },
+      "id": "742a659f-707d-4395-b2ed-6c69785847c8",
+      "name": "Every Day at 4pm",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        -6480,
+        1088
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1JTeeo25tTPt7VAPRQgbaQDF3cgJ1_mlLs3W8oyBFGJQ",
+          "mode": "list",
+          "cachedResultName": "appointement",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1JTeeo25tTPt7VAPRQgbaQDF3cgJ1_mlLs3W8oyBFGJQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet2",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "5fec4a6f-78f2-49f6-8cb1-edd2eae1f357",
+      "name": "Read Tomorrow's Appointments",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        -6240,
+        1088
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GuQoDQvYZtmHNCJT",
+          "name": "Google Sheets OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const appointments=$input.all().map(i=>i.json);\nconst BASE=0.4133,T={high:0.60,medium:0.40};\nconst W2={prior_no_shows:0.28,distance:0.18,lead_days:0.15,weather:0.10,reminder:0.10,age_group:0.07};\nconst RW={prior_no_shows:{'0':-0.150,'1':0.400,'2+':0.850},\n  distance:{near:-0.2705,mid:0.2295,far:0.5124},\n  lead_days:{short:-0.2022,medium:0.0649,long:0.1831},\n  weather:{Clear:-0.0336,Cloudy:-0.0108,Rainy:0.0288,Hot:0.1053,Sandstorm:0.2453,Cold:-0.3322},\n  reminder:{'true':-0.2113,'false':0.1622},\n  age_group:{child:-0.0431,adult:-0.0341,senior:0.2039}};\nfunction sig(x){return 1/(1+Math.exp(-x));}\nconst today=new Date().toISOString().split('T')[0];\nconst results=appointments.map(apt=>{\n  const prK=Number(apt.prior_no_shows)>=2?'2+':String(Math.min(1,Number(apt.prior_no_shows)||0));\n  const rem=String(apt.reminder_sent===true||apt.reminder_sent==='true'||apt.reminder_sent===1);\n  const distB=Number(apt.distance_km)>40?'far':Number(apt.distance_km)>15?'mid':'near';\n  let ld=Number(apt.lead_days)||0;\n  if(!ld&&apt.booked_date&&apt.appointment_date)\n    ld=Math.max(0,Math.round((new Date(apt.appointment_date)-new Date(apt.booked_date))/86400000));\n  const leadB=ld>14?'long':ld>7?'medium':'short';\n  const ageB=Number(apt.age)<18?'child':Number(apt.age)>70?'senior':'adult';\n  const wx=apt.weather||'Clear';\n  const wSum=W2.prior_no_shows*(RW.prior_no_shows[prK]??0)+W2.distance*(RW.distance[distB]??0)+\n    W2.lead_days*(RW.lead_days[leadB]??0)+W2.weather*(RW.weather[wx]??0)+\n    W2.reminder*(RW.reminder[rem]??0)+W2.age_group*(RW.age_group[ageB]??0);\n  const prob=Math.round(sig(Math.log(BASE/(1-BASE))+wSum*3.5)*100)/100;\n  const risk=prob>=T.high?'HIGH':prob>=T.medium?'MEDIUM':'LOW';\n  return {...apt,no_show_probability:prob,risk_level:risk,scored_at:new Date().toISOString()};\n});\nconst high=results.filter(r=>r.risk_level==='HIGH').length;\nconst med=results.filter(r=>r.risk_level==='MEDIUM').length;\nconst low=results.filter(r=>r.risk_level==='LOW').length;\nreturn [...results.map(r=>({json:r})),\n  {json:{_summary:true,total:results.length,high,medium:med,low,date:today}}];"
+      },
+      "id": "d33dbe98-20ff-47de-9456-de90a0be412c",
+      "name": "Batch Score All Appointments",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5984,
+        1088
+      ],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._summary }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "rightValue": true,
+              "id": "batch-if-summary"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f6d912e8-684f-437c-87f6-c826cc6ed4f1",
+      "name": "Is Summary Item?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -5744,
+        1088
+      ],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "chk-hr",
+              "leftValue": "={{ $('Read Today\\'s Appointments').item.json.risk_level }}",
+              "rightValue": "HIGH",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "27efa78a-9c20-49d9-8ac6-1bbee1f9b714",
+      "name": "Check High Risk (Batch)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -5520,
+        1168
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 JWT Middleware \u2500\u2500\n// Secret stored as n8n env var: JWT_SECRET\n// Header: Authorization: Bearer <token>\nconst crypto = require('crypto');\n\nconst SECRET = $vars.JWT_SECRET || 'CHANGE_ME_IN_N8N_ENV';\nconst req = $input.first().json;\nconst authHeader = req.headers?.authorization || req.headers?.Authorization || '';\nconst token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;\n\nif (!token) {\n  return [{ json: { _authError: true, status: 401, message: 'Missing Authorization header' } }];\n}\n\ntry {\n  // Manual HS256 JWT verification (no external library needed)\n  const parts = token.split('.');\n  if (parts.length !== 3) throw new Error('Malformed token');\n\n  const [headerB64, payloadB64, sigB64] = parts;\n\n  // Verify signature\n  const signingInput = `${headerB64}.${payloadB64}`;\n  const expectedSig = crypto\n    .createHmac('sha256', SECRET)\n    .update(signingInput)\n    .digest('base64url');\n\n  if (expectedSig !== sigB64) throw new Error('Invalid signature');\n\n  // Decode payload\n  const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));\n\n  // Check expiry\n  if (payload.exp && Date.now() / 1000 > payload.exp) throw new Error('Token expired');\n\n  // Attach user context to request, pass through\n  return [{ json: { ...req, _auth: { userId: payload.sub, role: payload.role, exp: payload.exp } } }];\n} catch (err) {\n  return [{ json: { _authError: true, status: 401, message: err.message } }];\n}"
+      },
+      "id": "17256ee5-dbc6-484d-a1da-0bca750468fd",
+      "name": "JWT Verify \u2013 New Appointment Booking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6784,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._authError }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "rightValue": true,
+              "id": "auth-JWT_A"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6b7ccbd0-be91-4ad4-8595-fee422fce040",
+      "name": "JWT Guard \u2013 New Appointment Booking",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -6624,
+        1328
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"success\": false, \"error\": $json.message, \"code\": 401 } }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "578b0af8-5a7d-451f-81aa-8ec07be8f01f",
+      "name": "Respond \u2013 401 \u2013 New Appointment Booking",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -6336,
+        1456
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Send confirmation to tomorrow's appointments via SSE/in-app \u2500\u2500\n// Filters only appointments for TOMORROW from the sheet data\nconst tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];\nconst appts = $input.all().map(i => i.json).filter(a => !a._summary && a.appointment_date === tomorrow);\n\nreturn appts.map(a => ({ json: {\n  appointment_id: a.appointment_id,\n  patient_id:     a.patient_id,\n  patient_name:   a.patient_name  || 'Patient',\n  patient_phone:  a.patient_phone || null,\n  doctor_id:      a.doctor_id     || null,\n  specialty:      a.specialty     || 'General Practice',\n  appointment_date: a.appointment_date,\n  appointment_hour: a.appointment_hour || 10,\n  risk_level:     a.risk_level    || 'LOW',\n  confirm_url:    `https://YOUR_N8N_HOST/webhook/confirm-attendance?apt=${a.appointment_id}&r=yes`,\n  decline_url:    `https://YOUR_N8N_HOST/webhook/confirm-attendance?apt=${a.appointment_id}&r=no`,\n  message: `\ud83c\udfe5 Doctome \u2013 Appointment Tomorrow\\n\\nHello ${a.patient_name || 'Patient'}, you have an appointment TOMORROW (${a.appointment_date}) at ${a.appointment_hour || 10}:00 (${a.specialty || ''}).\\n\\nWill you attend?\\n\u2705 YES: https://YOUR_N8N_HOST/webhook/confirm-attendance?apt=${a.appointment_id}&r=yes\\n\u274c NO: https://YOUR_N8N_HOST/webhook/confirm-attendance?apt=${a.appointment_id}&r=no`\n}}));"
+      },
+      "id": "6b25fb78-d1ee-44aa-81aa-f46c08f02922",
+      "name": "Prepare Confirmation Forms",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5296,
+        1088
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Twilio WhatsApp message per appointment\nconst a = $input.first().json;\nif (!a.patient_phone) return []; // skip if no phone\nreturn [{ json: a }];"
+      },
+      "id": "bc4d2377-3d64-4513-9e64-63141544bdc8",
+      "name": "Filter Has Phone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5072,
+        1088
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Build in-app notification for patient to confirm/decline \u2500\u2500\n// Instead of WhatsApp, we write to MongoDB notifications so the frontend\n// can poll/SSE and show the patient a YES/NO prompt in their dashboard.\nconst a = $input.first().json;\nif (!a.appointment_id) return [];\nconst BASE = 'https://YOUR_N8N_HOST/webhook';\nreturn [{ json: {\n  user_id:          a.patient_id,          // patient's user_id for SSE lookup\n  type:             'confirmation_request',\n  appointment_id:   a.appointment_id,\n  patient_name:     a.patient_name || 'Patient',\n  specialty:        a.specialty || '',\n  appointment_date: a.appointment_date,\n  appointment_hour: a.appointment_hour || 10,\n  risk_level:       a.risk_level || 'LOW',\n  confirm_url:      `${BASE}/confirm-attendance?apt=${a.appointment_id}&r=yes`,\n  decline_url:      `${BASE}/confirm-attendance?apt=${a.appointment_id}&r=no`,\n  message:          `\ud83d\udcc5 Please confirm your appointment on ${a.appointment_date} at ${a.appointment_hour || 10}:00 (${a.specialty || ''}).`,\n  sent_at:          new Date().toISOString(),\n  timestamp:        new Date().toISOString()\n} }];"
+      },
+      "id": "9cce0a09-56b0-4552-afba-13a2eb5dc009",
+      "name": "Build Patient Confirmation Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4880,
+        1088
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "confirmations",
+        "fields": "appointment_id,patient_id,patient_name,appointment_date,appointment_hour,risk_level,sent_at",
+        "options": {}
+      },
+      "id": "c5d47434-7390-4149-a647-613bdb2714e0",
+      "name": "Log Confirmation Sent \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4624,
+        1088
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "path": "confirm-attendance",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "1d22779e-f6f8-4df5-84ae-02b499f0815a",
+      "name": "GET /confirm-attendance",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -6240,
+        2592
+      ],
+      "webhookId": "34310c95-e3d3-4df1-b501-d1341d5dfa4b"
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Handle patient confirmation response \u2500\u2500\n// Called when patient clicks YES or NO link\nconst q = $input.first().json.query ?? {};\nconst aptId    = q.apt  || q.appointment_id;\nconst response = (q.r   || q.response || '').toLowerCase();   // 'yes' or 'no'\n\nif (!aptId || !['yes','no'].includes(response)) {\n  return [{ json: { _error: true, message: 'Invalid confirmation link' } }];\n}\n\nreturn [{ json: {\n  appointment_id: aptId,\n  confirmed:      response === 'yes',\n  declined:       response === 'no',\n  responded_at:   new Date().toISOString(),\n  response\n} }];"
+      },
+      "id": "8913369b-ef11-456a-9ee2-aee053aea33d",
+      "name": "Parse Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6000,
+        2592
+      ]
+    },
+    {
+      "parameters": {
+        "collection": "appointments",
+        "options": {
+          "limit": 1
+        },
+        "query": "={\"appointment_id\":\"{{$json.appointment_id}}\"}"
+      },
+      "id": "3686d59c-bdc4-44d7-bbbb-34e297afbeff",
+      "name": "Fetch Appointment Details",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -5760,
+        2592
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const conf = $('Parse Confirmation').first().json;\nconst apt  = $input.first().json;\nreturn [{ json: { ...apt, ...conf } }];"
+      },
+      "id": "c723fd7b-90fe-48ef-b163-71ab83128cf5",
+      "name": "Merge Confirmation + Appointment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5520,
+        2592
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "appointments",
+        "updateKey": "appointment_id",
+        "fields": "patient_confirmed,patient_declined,confirmation_response,responded_at",
+        "options": {}
+      },
+      "id": "8c29116f-8cc0-4a85-8701-fb621c852c5e",
+      "name": "Update Confirmation in MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -5280,
+        2592
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.declined }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "rightValue": true,
+              "id": "declined-chk"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e3d871d8-7ac4-41ff-a14d-860fda939606",
+      "name": "Did Patient Decline?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -5040,
+        2592
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Notify doctor when patient declines \u2500\u2500\n// Look up the appointment \u2192 find doctor \u2192 store SSE notification for doctor's user_id\nconst d = $input.first().json;\n// We store a notification for the doctor to be picked up via SSE\nreturn [{ json: {\n  user_id:       d.doctor_user_id || d.doctor_id || 'doctor',\n  type:          'patient_declined',\n  appointment_id: d.appointment_id,\n  patient_name:  d.patient_name || 'Patient',\n  specialty:     d.specialty    || '',\n  appointment_date: d.appointment_date,\n  appointment_hour: d.appointment_hour,\n  message:       `\u274c Patient ${d.patient_name || 'Patient'} declined their appointment on ${d.appointment_date} at ${d.appointment_hour}:00 (${d.specialty || ''})`,\n  timestamp:     new Date().toISOString()\n} }];"
+      },
+      "id": "df783946-ac0e-489e-9843-9e7545647fba",
+      "name": "Build Doctor Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4800,
+        2512
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "notifications",
+        "fields": "user_id,type,appointment_id,patient_name,specialty,appointment_date,appointment_hour,message,timestamp",
+        "options": {}
+      },
+      "id": "45c28e5b-6382-40cc-9419-db4d1805f51a",
+      "name": "Store Doctor Notification \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4560,
+        2512
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>\u2705 Confirmed!</h2><p>Thank you. We'll see you at your appointment. \ud83c\udfe5</p></body></html>",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "67093b28-8eb0-4c4c-909d-ae19f70ed76d",
+      "name": "Respond \u2013 Thank You (Yes)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -4800,
+        2688
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>\u274c Appointment Cancelled</h2><p>Your appointment has been noted as cancelled. We hope to see you soon.</p></body></html>",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "6f01bfa5-da96-465b-ba6c-3073de85ce70",
+      "name": "Respond \u2013 Cancelled (No)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -4560,
+        2688
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "b70feabb-15cc-471c-bac1-2c2fa7ac2108",
+      "name": "Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        -6240,
+        2784
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Find HIGH-risk appointments ~2 hours from now \u2500\u2500\n// Runs every 30 min. Checks appointments where:\n//   - appointment_date = today\n//   - appointment_hour is 2h ahead (within \u00b115 min window)\n//   - risk_level = HIGH\n//   - reminder_2h_sent != true  (idempotency guard)\nconst now    = new Date();\nconst target = new Date(now.getTime() + 2 * 60 * 60 * 1000);   // 2h from now\nconst today  = now.toISOString().split('T')[0];\nconst targetHour = target.getHours();  // e.g. if it's 08:00, target = 10\n\nreturn [{ json: {\n  _query: JSON.stringify({\n    appointment_date: today,\n    appointment_hour: targetHour,\n    risk_level: 'HIGH',\n    reminder_2h_sent: { $ne: true }\n  })\n} }];"
+      },
+      "id": "506a8d6f-20fc-4eff-b26a-8a166f7e2d30",
+      "name": "Build 2h Reminder Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6000,
+        2784
+      ]
+    },
+    {
+      "parameters": {
+        "collection": "appointments",
+        "options": {
+          "limit": 50
+        },
+        "query": "={{ $json._query }}"
+      },
+      "id": "424ff5b9-547a-492e-bc01-42b61cb235b6",
+      "name": "Find Upcoming HIGH-Risk Apts",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -5760,
+        2784
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $input.all().length }}",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              },
+              "rightValue": 0,
+              "id": "reminder-found"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "792fd5c0-07aa-4614-8136-d63822abfe2a",
+      "name": "Any Appointments Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -5520,
+        2784
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Send 2h reminder WhatsApp message \u2500\u2500\nconst a = $input.first().json;\nif (!a.patient_phone) return [];\nconst msg = `\u23f0 Doctome Reminder\\n\\nHi ${a.patient_name || 'Patient'}, your appointment is in approximately 2 hours (${a.appointment_hour}:00, ${a.specialty || ''}).\\n\\nPlease make sure you're on your way. We look forward to seeing you! \ud83c\udfe5`;\nreturn [{ json: { ...a, _reminderMessage: msg } }];"
+      },
+      "id": "43c8c336-bb20-445f-b60d-7d5b9a03fae0",
+      "name": "Prepare Reminder Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5280,
+        2704
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Build in-app 2h reminder notification for patient \u2500\u2500\nconst a = $input.first().json;\nif (!a.patient_id) return [];\nreturn [{ json: {\n  user_id:          a.patient_id,\n  type:             'reminder_2h',\n  appointment_id:   a.appointment_id,\n  patient_name:     a.patient_name || 'Patient',\n  specialty:        a.specialty || '',\n  appointment_date: a.appointment_date,\n  appointment_hour: a.appointment_hour || 10,\n  message:          `\u23f0 Reminder: your appointment is in ~2 hours at ${a.appointment_hour || 10}:00 (${a.specialty || ''}). Please head over soon! \ud83c\udfe5`,\n  timestamp:        new Date().toISOString()\n} }];"
+      },
+      "id": "5d5c0e9b-3a41-4465-99c5-9ac6dd2683d7",
+      "name": "Build 2h Reminder Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5040,
+        2704
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mark reminder as sent to prevent duplicate sends\nconst a = $input.first().json;\nreturn [{ json: {\n  _filter: JSON.stringify({ appointment_id: a.appointment_id }),\n  appointment_id: a.appointment_id,\n  patient_name: a.patient_name\n} }];"
+      },
+      "id": "10b039d4-ac5e-4867-a854-43a72ea5733e",
+      "name": "Mark reminder_2h_sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4784,
+        2848
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "appointments",
+        "updateKey": "appointment_id",
+        "fields": "reminder_2h_sent,reminder_2h_at",
+        "options": {}
+      },
+      "id": "d6788211-4777-40af-8d85-7617771ed404",
+      "name": "Update Reminder Flag \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4576,
+        2864
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { status: 'no_high_risk_appointments_in_2h', ts: new Date().toISOString() } }];"
+      },
+      "id": "72a9aa3a-7a67-4398-9177-acd05a8678c9",
+      "name": "No Reminders Needed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5280,
+        2864
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Find HIGH-risk patients with future appointments to offer freed slot \u2500\u2500\n// Triggered after a patient declines. d = declined appointment details.\nconst d = $input.first().json;\nconst today = new Date().toISOString().split('T')[0];\n// Build query: future appointments that are HIGH risk, not yet confirmed, different appointment\nconst query = JSON.stringify({\n  appointment_date: { $gte: today },\n  risk_level:       'HIGH',\n  appointment_id:   { $ne: d.appointment_id },\n  patient_confirmed: { $ne: true },\n  patient_declined:  { $ne: true },\n  reschedule_offer_sent: { $ne: true }\n});\nreturn [{ json: {\n  _freed_appointment_id:   d.appointment_id,\n  _freed_appointment_date: d.appointment_date,\n  _freed_appointment_hour: d.appointment_hour || 10,\n  _freed_specialty:        d.specialty || '',\n  _freed_doctor_id:        d.doctor_id || d.doctor_user_id || 'unknown',\n  _query: query\n} }];"
+      },
+      "id": "41d3367d-1b93-4ac8-b5b6-8cd536686b3c",
+      "name": "Find HIGH-Risk Patients for Reschedule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4320,
+        2512
+      ]
+    },
+    {
+      "parameters": {
+        "collection": "appointments",
+        "options": {
+          "limit": 20,
+          "sort": "{\"no_show_probability\":-1}"
+        },
+        "query": "={{ $json._query }}"
+      },
+      "id": "f70080e8-f4c6-41dc-8f8b-c2a84bb6e4cf",
+      "name": "Fetch HIGH-Risk Future Patients",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4080,
+        2512
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Build reschedule offer record and per-patient notifications \u2500\u2500\n// We emit TWO types of items:\n//   1. One offer record (type=_offer) to store in reschedule_offers collection\n//   2. One notification per patient to store in notifications collection\nconst patients = $input.all().map(i => i.json);\nif (!patients.length) return [{ json: { _noPatients: true } }];\n\n// Grab freed slot info from the first item's context carried via Code node above\n// (n8n re-attaches using $('Find HIGH-Risk Patients for Reschedule').first())\nconst ctx = $('Find HIGH-Risk Patients for Reschedule').first().json;\nconst offerId = `offer_${ctx._freed_appointment_id}_${Date.now()}`;\nconst BASE     = 'https://YOUR_N8N_HOST/webhook';\nconst patientIds = patients.map(p => p.patient_id);\n\n// \u2500\u2500 1 offer record \u2500\u2500\nconst offerRecord = {\n  _item_type:           '_offer',\n  offer_id:             offerId,\n  slot_appointment_id:  ctx._freed_appointment_id,\n  slot_date:            ctx._freed_appointment_date,\n  slot_hour:            ctx._freed_appointment_hour,\n  slot_specialty:       ctx._freed_specialty,\n  doctor_id:            ctx._freed_doctor_id,\n  offered_to:           patientIds,\n  status:               'pending',\n  accepted_by:          null,\n  created_at:           new Date().toISOString()\n};\n\n// \u2500\u2500 1 notification per patient \u2500\u2500\nconst notifications = patients.map(p => ({\n  _item_type:       '_notification',\n  offer_id:         offerId,\n  user_id:          p.patient_id,\n  type:             'reschedule_offer',\n  appointment_id:   p.appointment_id,   // patient's OWN appointment\n  slot_appointment_id: ctx._freed_appointment_id,\n  message:          `\ud83d\udce2 A slot just opened up!\\n${ctx._freed_specialty || 'Medical'} appointment on ${ctx._freed_appointment_date} at ${ctx._freed_appointment_hour || '?'}:00.\\nWant to reschedule your appointment to this slot?\\n\u2705 YES: ${BASE}/reschedule-accept?offer=${offerId}&patient=${p.patient_id}&r=yes\\n\u274c NO: ${BASE}/reschedule-accept?offer=${offerId}&patient=${p.patient_id}&r=no`,\n  accept_url:       `${BASE}/reschedule-accept?offer=${offerId}&patient=${p.patient_id}&r=yes`,\n  decline_url:      `${BASE}/reschedule-accept?offer=${offerId}&patient=${p.patient_id}&r=no`,\n  timestamp:        new Date().toISOString()\n}));\n\nreturn [offerRecord, ...notifications].map(j => ({ json: j }));"
+      },
+      "id": "c1d7a1da-e655-4f8f-907d-da5c04ea5dd2",
+      "name": "Build Reschedule Offer & Notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3840,
+        2512
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json._item_type }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "_offer",
+              "id": "is-offer-record"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a72a69f8-d9a9-4daa-ac7d-13e930ad266f",
+      "name": "Offer Record or Notification?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3600,
+        2512
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "reschedule_offers",
+        "fields": "offer_id,slot_appointment_id,slot_date,slot_hour,slot_specialty,doctor_id,offered_to,status,accepted_by,created_at",
+        "options": {}
+      },
+      "id": "c45c12be-a768-4f99-a7b2-08bdebf4bdd4",
+      "name": "Store Reschedule Offer \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -3360,
+        2464
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "notifications",
+        "fields": "offer_id,user_id,type,appointment_id,slot_appointment_id,message,accept_url,decline_url,timestamp",
+        "options": {}
+      },
+      "id": "466c8d51-20e6-4231-a849-6cfc2d7156e7",
+      "name": "Notify Patients of Slot Offer \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -3360,
+        2640
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "path": "reschedule-accept",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "5d96c4b8-d728-43cb-b563-24e75e8ddef5",
+      "name": "GET /reschedule-accept",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -6240,
+        3056
+      ],
+      "webhookId": "9a5bbbe4-d113-4a10-bf66-53eb73c6cb03"
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Parse reschedule accept/decline response \u2500\u2500\nconst q = $input.first().json.query ?? {};\nconst offerId   = q.offer   || null;\nconst patientId = q.patient || null;\nconst response  = (q.r || '').toLowerCase(); // 'yes' or 'no'\n\nif (!offerId || !patientId || !['yes','no'].includes(response)) {\n  return [{ json: { _error: true, message: 'Invalid reschedule link' } }];\n}\nreturn [{ json: {\n  offer_id:   offerId,\n  patient_id: patientId,\n  accepted:   response === 'yes',\n  declined:   response === 'no',\n  responded_at: new Date().toISOString()\n} }];"
+      },
+      "id": "aeb982d7-4bbf-4fd0-a5b5-7e775af750cf",
+      "name": "Parse Reschedule Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -6000,
+        3056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const resp  = $('Parse Reschedule Response').first().json;\nconst offer = $input.first().json;\nreturn [{ json: { ...offer, ...resp } }];"
+      },
+      "id": "cacfed70-3fd4-4632-821f-fc469f9b3d0b",
+      "name": "Merge Offer + Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5520,
+        3056
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              },
+              "rightValue": "pending",
+              "id": "slot-pending"
+            },
+            {
+              "leftValue": "={{ $json.accepted }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "rightValue": true,
+              "id": "patient-said-yes"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "29bdfab9-39ae-40cb-87e7-98fac25fe4bc",
+      "name": "Slot Still Available & Patient Accepts?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -5280,
+        3056
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Process accepted reschedule \u2500\u2500\n// 1. Mark offer as accepted\n// 2. Swap appointment_id for the accepting patient  \n// 3. Create notifications telling other patients the slot is gone\nconst d = $input.first().json;\nreturn [{ json: {\n  // Data for the offer update\n  offer_id:           d.offer_id,\n  accepted_by:        d.patient_id,\n  status:             'accepted',\n  accepted_at:        new Date().toISOString(),\n  slot_appointment_id: d.slot_appointment_id,\n  slot_date:          d.slot_date,\n  slot_hour:          d.slot_hour,\n  slot_specialty:     d.slot_specialty,\n  patient_id:         d.patient_id,\n  offered_to:         d.offered_to || []\n} }];"
+      },
+      "id": "eec5b614-ec75-4481-a9d1-f41a4fd80141",
+      "name": "Process Reschedule Accept",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -5040,
+        2976
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "reschedule_offers",
+        "updateKey": "offer_id",
+        "fields": "status,accepted_by,accepted_at",
+        "options": {}
+      },
+      "id": "cce26a45-c2e8-42b4-bc5a-4a9f67880c61",
+      "name": "Mark Offer Accepted \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4800,
+        2976
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// \u2500\u2500 Notify other patients that the slot has been taken \u2500\u2500\n// For each patient in offered_to (except the one who accepted), \n// insert a notification that the slot is no longer available.\nconst d = $input.first().json;\nconst others = (d.offered_to || []).filter(pid => pid !== d.accepted_by);\nif (!others.length) return [{ json: { _noOthers: true } }];\n\nreturn others.map(pid => ({ json: {\n  user_id:    pid,\n  type:       'reschedule_slot_taken',\n  offer_id:   d.offer_id,\n  message:    `\u2139\ufe0f The slot on ${d.slot_date} at ${d.slot_hour || '?'}:00 (${d.slot_specialty || ''}) has been taken by another patient.`,\n  timestamp:  new Date().toISOString()\n} }));"
+      },
+      "id": "869db662-836f-4308-9130-312781afceb6",
+      "name": "Notify Others Slot Taken",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -4560,
+        2976
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "collection": "notifications",
+        "fields": "user_id,type,offer_id,message,timestamp",
+        "options": {}
+      },
+      "id": "471dddfa-04b4-4cf1-bd25-4593db5a2486",
+      "name": "Store Slot-Taken Notifications \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -4320,
+        2976
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>\u2705 Reschedule Confirmed!</h2><p>You have been rescheduled to the new slot. See you there! \ud83c\udfe5</p></body></html>",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "e17a3ead-b9cf-4f00-9db5-2d6192c5f1ed",
+      "name": "Respond \u2013 Reschedule Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -4080,
+        2976
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>\u26a0\ufe0f Slot Already Taken</h2><p>Sorry, this slot was just taken by another patient. Please contact the clinic for alternatives.</p></body></html>",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "c1cca8fb-c457-4a41-901d-4087ed0e97a4",
+      "name": "Respond \u2013 Slot Already Taken",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -5024,
+        3120
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<html><body style='font-family:sans-serif;text-align:center;padding:60px'><h2>\ud83d\udc4d Got it!</h2><p>You have declined this offer. No changes were made to your appointment.</p></body></html>",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html"
+              }
+            ]
+          }
+        }
+      },
+      "id": "147f0378-15c8-4a6d-b581-338592d8aa62",
+      "name": "Respond \u2013 Reschedule Declined",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -5040,
+        3216
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Tag each high-risk patient's appointment so we don't spam them\nconst n = $input.first().json;\nif (n._item_type !== '_notification' || n._noPatients) return [];\nreturn [{ json: {\n  appointment_id: n.appointment_id,\n  reschedule_offer_sent: true,\n  reschedule_offer_sent_at: new Date().toISOString()\n} }];"
+      },
+      "id": "49b36386-3d09-4205-aab9-a20d825ff6fd",
+      "name": "Mark reschedule_offer_sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3120,
+        2592
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "collection": "appointments",
+        "updateKey": "appointment_id",
+        "fields": "reschedule_offer_sent,reschedule_offer_sent_at",
+        "options": {}
+      },
+      "id": "02870261-37a4-4436-8838-d21547265a93",
+      "name": "Update Offer Sent Flag \u2192 MongoDB",
+      "type": "n8n-nodes-base.mongoDb",
+      "typeVersion": 1.2,
+      "position": [
+        -2880,
+        2592
+      ],
+      "credentials": {
+        "mongoDb": {
+          "id": "feLbXQZWdWxQ2gLT",
+          "name": "MongoDB account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Fetch Weather": {
+      "main": [
+        [
+          {
+            "node": "Enrich with Weather",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich with Weather": {
+      "main": [
+        [
+          {
+            "node": "No-Show Scoring Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "No-Show Scoring Engine": {
+      "main": [
+        [
+          {
+            "node": "Prepare Appointment for DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Risk Level": {
+      "main": [
+        [
+          {
+            "node": "Store HIGH Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "MEDIUM \u2013 Log Note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LOW \u2013 Log Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store HIGH Notification": {
+      "main": [
+        [
+          {
+            "node": "Write Notification \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Summary Item?": {
+      "main": [
+        [
+          {
+            "node": "Check High Risk (Batch)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Appointment Booking": {
+      "main": [
+        [
+          {
+            "node": "JWT Verify \u2013 New Appointment Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JWT Verify \u2013 New Appointment Booking": {
+      "main": [
+        [
+          {
+            "node": "JWT Guard \u2013 New Appointment Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JWT Guard \u2013 New Appointment Booking": {
+      "main": [
+        [
+          {
+            "node": "Respond \u2013 401 \u2013 New Appointment Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch Weather",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batch Score All Appointments": {
+      "main": [
+        [
+          {
+            "node": "Is Summary Item?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Prepare Confirmation Forms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Confirmation Forms": {
+      "main": [
+        [
+          {
+            "node": "Filter Has Phone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Has Phone": {
+      "main": [
+        [
+          {
+            "node": "Build Patient Confirmation Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET /confirm-attendance": {
+      "main": [
+        [
+          {
+            "node": "Parse Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Fetch Appointment Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Appointment Details": {
+      "main": [
+        [
+          {
+            "node": "Merge Confirmation + Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Confirmation + Appointment": {
+      "main": [
+        [
+          {
+            "node": "Update Confirmation in MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Confirmation in MongoDB": {
+      "main": [
+        [
+          {
+            "node": "Did Patient Decline?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Did Patient Decline?": {
+      "main": [
+        [
+          {
+            "node": "Build Doctor Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond \u2013 Thank You (Yes)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Doctor Notification": {
+      "main": [
+        [
+          {
+            "node": "Store Doctor Notification \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Doctor Notification \u2192 MongoDB": {
+      "main": [
+        [
+          {
+            "node": "Find HIGH-Risk Patients for Reschedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 30 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Build 2h Reminder Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build 2h Reminder Query": {
+      "main": [
+        [
+          {
+            "node": "Find Upcoming HIGH-Risk Apts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Upcoming HIGH-Risk Apts": {
+      "main": [
+        [
+          {
+            "node": "Any Appointments Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Appointments Found?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Reminder Messages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Reminders Needed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Reminder Messages": {
+      "main": [
+        [
+          {
+            "node": "Build 2h Reminder Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark reminder_2h_sent": {
+      "main": [
+        [
+          {
+            "node": "Update Reminder Flag \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Day at 4pm": {
+      "main": [
+        [
+          {
+            "node": "Read Tomorrow's Appointments",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Tomorrow's Appointments": {
+      "main": [
+        [
+          {
+            "node": "Batch Score All Appointments",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check High Risk (Batch)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Patient Confirmation Notification": {
+      "main": [
+        [
+          {
+            "node": "Log Confirmation Sent \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build 2h Reminder Notification": {
+      "main": [
+        [
+          {
+            "node": "Mark reminder_2h_sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find HIGH-Risk Patients for Reschedule": {
+      "main": [
+        [
+          {
+            "node": "Fetch HIGH-Risk Future Patients",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch HIGH-Risk Future Patients": {
+      "main": [
+        [
+          {
+            "node": "Build Reschedule Offer & Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Reschedule Offer & Notifications": {
+      "main": [
+        [
+          {
+            "node": "Offer Record or Notification?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Offer Record or Notification?": {
+      "main": [
+        [
+          {
+            "node": "Store Reschedule Offer \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Patients of Slot Offer \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Patients of Slot Offer \u2192 MongoDB": {
+      "main": [
+        [
+          {
+            "node": "Mark reschedule_offer_sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark reschedule_offer_sent": {
+      "main": [
+        [
+          {
+            "node": "Update Offer Sent Flag \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GET /reschedule-accept": {
+      "main": [
+        [
+          {
+            "node": "Parse Reschedule Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Offer + Response": {
+      "main": [
+        [
+          {
+            "node": "Slot Still Available & Patient Accepts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Still Available & Patient Accepts?": {
+      "main": [
+        [
+          {
+            "node": "Process Reschedule Accept",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond \u2013 Slot Already Taken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Reschedule Accept": {
+      "main": [
+        [
+          {
+            "node": "Mark Offer Accepted \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Offer Accepted \u2192 MongoDB": {
+      "main": [
+        [
+          {
+            "node": "Notify Others Slot Taken",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Others Slot Taken": {
+      "main": [
+        [
+          {
+            "node": "Store Slot-Taken Notifications \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Slot-Taken Notifications \u2192 MongoDB": {
+      "main": [
+        [
+          {
+            "node": "Respond \u2013 Reschedule Accepted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Appointment for DB": {
+      "main": [
+        [
+          {
+            "node": "Insert Appointment \u2192 MongoDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Appointment \u2192 MongoDB": {
+      "main": [
+        [
+          {
+            "node": "Route by Risk Level",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "54b76404-50fc-40f2-ae6d-5aa3a935cc7a",
+  "meta": {
+    "instanceId": "ec22fe28cf6e61cb2802a32e8bf47fbd6fcfa0a8c5184abe5351ec756c9076dc"
+  },
+  "id": "vJSHD3UFiCHUlkzC",
+  "tags": [
+    {
+      "updatedAt": "2026-04-17T14:32:47.155Z",
+      "createdAt": "2026-04-17T14:32:47.155Z",
+      "id": "5wW1lascmPv05L7j",
+      "name": "Batch"
+    },
+    {
+      "updatedAt": "2026-04-17T14:28:54.430Z",
+      "createdAt": "2026-04-17T14:28:54.430Z",
+      "id": "DPxe8kn1YLHrLiz4",
+      "name": "No-Show"
+    },
+    {
+      "updatedAt": "2026-04-17T21:40:16.860Z",
+      "createdAt": "2026-04-17T21:40:16.860Z",
+      "id": "NL5NvyQLfijXZcQ1",
+      "name": "SSE-Notifications"
+    },
+    {
+      "updatedAt": "2026-04-17T21:40:16.822Z",
+      "createdAt": "2026-04-17T21:40:16.822Z",
+      "id": "SHrlaJkfeix5pjje",
+      "name": "JWT-Auth"
+    },
+    {
+      "updatedAt": "2026-04-17T21:40:16.797Z",
+      "createdAt": "2026-04-17T21:40:16.797Z",
+      "id": "WOVR8OMHzRIQNueB",
+      "name": "Dashboard-Patients"
+    },
+    {
+      "updatedAt": "2026-04-17T14:28:54.468Z",
+      "createdAt": "2026-04-17T14:28:54.468Z",
+      "id": "ZpQbxXj6XY4y1q8R",
+      "name": "Doctome"
+    },
+    {
+      "updatedAt": "2026-04-17T21:40:16.903Z",
+      "createdAt": "2026-04-17T21:40:16.903Z",
+      "id": "a62NuIWHv8Mo5fIh",
+      "name": "2h-Reminder"
+    },
+    {
+      "updatedAt": "2026-04-17T21:40:16.771Z",
+      "createdAt": "2026-04-17T21:40:16.771Z",
+      "id": "anlpJPPSS6ebhAVI",
+      "name": "Dashboard-Appointments"
+    },
+    {
+      "updatedAt": "2026-04-17T20:12:52.895Z",
+      "createdAt": "2026-04-17T20:12:52.895Z",
+      "id": "e5yGFJYoCUNLuzjo",
+      "name": "Patients-CRUD"
+    },
+    {
+      "updatedAt": "2026-04-17T14:28:54.499Z",
+      "createdAt": "2026-04-17T14:28:54.499Z",
+      "id": "iR3jKYMyE3ZClvJf",
+      "name": "Prediction"
+    },
+    {
+      "updatedAt": "2026-04-17T21:40:16.882Z",
+      "createdAt": "2026-04-17T21:40:16.882Z",
+      "id": "srsWmFlxcLfomTnC",
+      "name": "Confirmations"
+    },
+    {
+      "updatedAt": "2026-04-17T14:32:47.183Z",
+      "createdAt": "2026-04-17T14:32:47.183Z",
+      "id": "tdlgXDB93SOoi6ca",
+      "name": "Scheduler"
+    },
+    {
+      "updatedAt": "2026-04-17T20:12:52.927Z",
+      "createdAt": "2026-04-17T20:12:52.927Z",
+      "id": "wKl0ey0k1YuZRBwI",
+      "name": "Doctors-CRUD"
+    }
+  ]
+}
